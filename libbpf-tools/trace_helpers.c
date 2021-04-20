@@ -6,7 +6,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
 #include <sys/resource.h>
 #include <time.h>
 #include "trace_helpers.h"
@@ -327,15 +326,19 @@ void print_log2_hist(unsigned int *vals, int vals_size, const char *val_type)
 	}
 }
 
-void print_linear_hist(unsigned int *vals, int vals_size, const char *val_type)
+void print_linear_hist(unsigned int *vals, int vals_size, unsigned int base,
+		unsigned int step, const char *val_type)
 {
-	int i, stars_max = 40, idx_max = -1;
+	int i, stars_max = 40, idx_min = -1, idx_max = -1;
 	unsigned int val, val_max = 0;
 
 	for (i = 0; i < vals_size; i++) {
 		val = vals[i];
-		if (val > 0)
+		if (val > 0) {
 			idx_max = i;
+			if (idx_min < 0)
+				idx_min = i;
+		}
 		if (val > val_max)
 			val_max = val;
 	}
@@ -344,9 +347,9 @@ void print_linear_hist(unsigned int *vals, int vals_size, const char *val_type)
 		return;
 
 	printf("     %-13s : count     distribution\n", val_type);
-	for (i = 0; i <= idx_max;  i++) {
+	for (i = idx_min; i <= idx_max; i++) {
 		val = vals[i];
-		printf("        %-10d : %-8d |", i, val);
+		printf("        %-10d : %-8d |", base + i * step, val);
 		print_stars(val, val_max, stars_max);
 		printf("|\n");
 	}
@@ -368,4 +371,27 @@ int bump_memlock_rlimit(void)
 	};
 
 	return setrlimit(RLIMIT_MEMLOCK, &rlim_new);
+}
+
+bool is_kernel_module(const char *name)
+{
+	bool found = false;
+	char buf[64];
+	FILE *f;
+
+	f = fopen("/proc/modules", "r");
+	if (!f)
+		return false;
+
+	while (fgets(buf, sizeof(buf), f) != NULL) {
+		if (sscanf(buf, "%s %*s\n", buf) != 1)
+			break;
+		if (!strcmp(buf, name)) {
+			found = true;
+			break;
+		}
+	}
+
+	fclose(f);
+	return found;
 }

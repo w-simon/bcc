@@ -17,6 +17,7 @@ try:
     from collections.abc import MutableMapping
 except ImportError:
     from collections import MutableMapping
+from time import strftime
 import ctypes as ct
 from functools import reduce
 import multiprocessing
@@ -104,6 +105,30 @@ def _stars(val, val_max, width):
         text = text[:-1] + "+"
     return text
 
+def _print_json_hist(vals, val_type, section_bucket=None):
+    hist_list = []
+    max_nonzero_idx = 0
+    for i in range(len(vals)):
+        if vals[i] != 0:
+            max_nonzero_idx = i
+    index = 1
+    prev = 0
+    for i in range(len(vals)):
+        if i != 0 and i <= max_nonzero_idx:
+            index = index * 2
+
+            list_obj = {}
+            list_obj['interval-start'] = prev
+            list_obj['interval-end'] = int(index) - 1
+            list_obj['count'] = int(vals[i])
+
+            hist_list.append(list_obj)
+
+            prev = index
+    histogram = {"ts": strftime("%Y-%m-%d %H:%M:%S"), "val_type": val_type, "data": hist_list}
+    if section_bucket:
+        histogram[section_bucket[0]] = section_bucket[1]
+    print(histogram)
 
 def _print_log2_hist(vals, val_type, strip_leading_zero):
     global stars_max
@@ -372,6 +397,31 @@ class TableBase(MutableMapping):
         for k in self.keys():
             self.__delitem__(k)
 
+    def items_lookup_and_delete_batch(self):
+        # batch size is set to the maximum
+        batch_size = self.max_entries
+        out_batch = ct.c_uint32(0)
+        keys = (type(self.Key()) * batch_size)()
+        values = (type(self.Leaf()) * batch_size)()
+        count = ct.c_uint32(batch_size)
+        res = lib.bpf_lookup_and_delete_batch(self.map_fd,
+                                              None,
+                                              ct.byref(out_batch),
+                                              ct.byref(keys),
+                                              ct.byref(values),
+                                              ct.byref(count)
+                                              )
+
+        errcode = ct.get_errno()
+        if (errcode == errno.EINVAL):
+            raise Exception("BPF_MAP_LOOKUP_AND_DELETE_BATCH is invalid.")
+
+        if (res != 0 and errcode != errno.ENOENT):
+            raise Exception("BPF_MAP_LOOKUP_AND_DELETE_BATCH has failed")
+
+        for i in range(0, count.value):
+            yield (keys[i], values[i])
+
     def zero(self):
         # Even though this is not very efficient, we grab the entire list of
         # keys before enumerating it. This helps avoid a potential race where
@@ -412,6 +462,65 @@ class TableBase(MutableMapping):
             raise StopIteration()
         return next_key
 
+    def decode_c_struct(self, tmp, buckets, bucket_fn, bucket_sort_fn):
+        f1 = self.Key._fields_[0][0]
+        f2 = self.Key._fields_[1][0]
+        # The above code assumes that self.Key._fields_[1][0] holds the
+        # slot. But a padding member may have been inserted here, which
+        # breaks the assumption and leads to chaos.
+        # TODO: this is a quick fix. Fixing/working around in the BCC
+        # internal library is the right thing to do.
+        if f2 == '__pad_1' and len(self.Key._fields_) == 3:
+            f2 = self.Key._fields_[2][0]
+        for k, v in self.items():
+            bucket = getattr(k, f1)
+            if bucket_fn:
+                bucket = bucket_fn(bucket)
+            vals = tmp[bucket] = tmp.get(bucket, [0] * log2_index_max)
+            slot = getattr(k, f2)
+            vals[slot] = v.value
+        buckets_lst = list(tmp.keys())
+        if bucket_sort_fn:
+            buckets_lst = bucket_sort_fn(buckets_lst)
+        for bucket in buckets_lst:
+            buckets.append(bucket)
+
+    def print_json_hist(self, val_type="value", section_header="Bucket ptr",
+                        section_print_fn=None, bucket_fn=None, bucket_sort_fn=None):
+        """print_json_hist(val_type="value", section_header="Bucket ptr",
+                                   section_print_fn=None, bucket_fn=None,
+                                   bucket_sort_fn=None):
+
+                Prints a table as a json histogram. The table must be stored as
+                log2. The val_type argument is optional, and is a column header.
+                If the histogram has a secondary key, the dictionary will be split by secondary key
+                If section_print_fn is not None, it will be passed the bucket value
+                to format into a string as it sees fit. If bucket_fn is not None,
+                it will be used to produce a bucket value for the histogram keys.
+                If bucket_sort_fn is not None, it will be used to sort the buckets
+                before iterating them, and it is useful when there are multiple fields
+                in the secondary key.
+                The maximum index allowed is log2_index_max (65), which will
+                accommodate any 64-bit integer in the histogram.
+                """
+        if isinstance(self.Key(), ct.Structure):
+            tmp = {}
+            buckets = []
+            self.decode_c_struct(tmp, buckets, bucket_fn, bucket_sort_fn)
+            for bucket in buckets:
+                vals = tmp[bucket]
+                if section_print_fn:
+                    section_bucket = (section_header, section_print_fn(bucket))
+                else:
+                    section_bucket = (section_header, bucket)
+                _print_json_hist(vals, val_type, section_bucket)
+
+        else:
+            vals = [0] * log2_index_max
+            for k, v in self.items():
+                vals[k.value] = v.value
+            _print_json_hist(vals, val_type)
+
     def print_log2_hist(self, val_type="value", section_header="Bucket ptr",
             section_print_fn=None, bucket_fn=None, strip_leading_zero=None,
             bucket_sort_fn=None):
@@ -436,29 +545,8 @@ class TableBase(MutableMapping):
         """
         if isinstance(self.Key(), ct.Structure):
             tmp = {}
-            f1 = self.Key._fields_[0][0]
-            f2 = self.Key._fields_[1][0]
-
-            # The above code assumes that self.Key._fields_[1][0] holds the
-            # slot. But a padding member may have been inserted here, which
-            # breaks the assumption and leads to chaos.
-            # TODO: this is a quick fix. Fixing/working around in the BCC
-            # internal library is the right thing to do.
-            if f2 == '__pad_1' and len(self.Key._fields_) == 3:
-                f2 = self.Key._fields_[2][0]
-
-            for k, v in self.items():
-                bucket = getattr(k, f1)
-                if bucket_fn:
-                    bucket = bucket_fn(bucket)
-                vals = tmp[bucket] = tmp.get(bucket, [0] * log2_index_max)
-                slot = getattr(k, f2)
-                vals[slot] = v.value
-
-            buckets = list(tmp.keys())
-            if bucket_sort_fn:
-                buckets = bucket_sort_fn(buckets)
-
+            buckets = []
+            self.decode_c_struct(tmp, buckets, bucket_fn, bucket_sort_fn)
             for bucket in buckets:
                 vals = tmp[bucket]
                 if section_print_fn:
@@ -494,19 +582,8 @@ class TableBase(MutableMapping):
         """
         if isinstance(self.Key(), ct.Structure):
             tmp = {}
-            f1 = self.Key._fields_[0][0]
-            f2 = self.Key._fields_[1][0]
-            for k, v in self.items():
-                bucket = getattr(k, f1)
-                if bucket_fn:
-                    bucket = bucket_fn(bucket)
-                vals = tmp[bucket] = tmp.get(bucket, [0] * linear_index_max)
-                slot = getattr(k, f2)
-                vals[slot] = v.value
-
-            buckets = tmp.keys()
-            if bucket_sort_fn:
-                buckets = bucket_sort_fn(buckets)
+            buckets = []
+            self.decode_c_struct(tmp, buckets, bucket_fn, bucket_sort_fn)
 
             for bucket in buckets:
                 vals = tmp[bucket]
@@ -532,6 +609,8 @@ class TableBase(MutableMapping):
 class HashTable(TableBase):
     def __init__(self, *args, **kwargs):
         super(HashTable, self).__init__(*args, **kwargs)
+        self.max_entries = int(lib.bpf_table_max_entries_id(self.bpf.module,
+                                                            self.map_id))
 
     def __len__(self):
         i = 0

@@ -254,6 +254,15 @@ static struct bpf_helper helpers[] = {
   {"per_cpu_ptr", "5.10"},
   {"this_cpu_ptr", "5.10"},
   {"redirect_peer", "5.10"},
+  {"task_storage_get", "5.11"},
+  {"task_storage_delete", "5.11"},
+  {"get_current_task_btf", "5.11"},
+  {"bprm_opts_set", "5.11"},
+  {"ktime_get_coarse_ns", "5.11"},
+  {"ima_inode_hash", "5.11"},
+  {"sock_from_file", "5.11"},
+  {"check_mtu", "5.12"},
+  {"for_each_map_elem", "5.13"},
 };
 
 static uint64_t ptr_to_u64(void *ptr)
@@ -347,6 +356,13 @@ int bpf_delete_elem(int fd, void *key)
 int bpf_lookup_and_delete(int fd, void *key, void *value)
 {
   return bpf_map_lookup_and_delete_elem(fd, key, value);
+}
+
+int bpf_lookup_and_delete_batch(int fd, __u32 *in_batch, __u32 *out_batch, void *keys,
+                                void *values, __u32 *count)
+{
+  return bpf_map_lookup_and_delete_batch(fd, in_batch, out_batch, keys, values,
+                                         count, NULL);
 }
 
 int bpf_get_first_key(int fd, void *key, size_t key_size)
@@ -594,6 +610,9 @@ int bcc_prog_load_xattr(struct bpf_load_program_attr *attr, int prog_len,
     else if (strncmp(attr->name, "kfunc__", 7) == 0) {
       name_offset = 7;
       expected_attach_type = BPF_TRACE_FENTRY;
+    } else if (strncmp(attr->name, "kmod_ret__", 10) == 0) {
+      name_offset = 10;
+      expected_attach_type = BPF_MODIFY_RETURN;
     } else if (strncmp(attr->name, "kretfunc__", 10) == 0) {
       name_offset = 10;
       expected_attach_type = BPF_TRACE_FEXIT;
