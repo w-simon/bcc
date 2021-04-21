@@ -66,6 +66,7 @@ enum event_type {
 struct data_t {
     enum event_type type;
     pid_t pid, tgid;
+    pid_t ppid; // Parent PID as in the userspace term (i.e task->real_parent->tgid in kernel)
     union {
         /* EVENT_MOUNT, EVENT_UMOUNT */
         struct {
@@ -97,6 +98,8 @@ int syscall__mount(struct pt_regs *ctx, char __user *source,
 
     event.pid = bpf_get_current_pid_tgid() & 0xffffffff;
     event.tgid = bpf_get_current_pid_tgid() >> 32;
+    task = (struct task_struct *)bpf_get_current_task();
+    event.ppid = task->real_parent->tgid;
 
     event.type = EVENT_MOUNT;
     bpf_get_current_comm(event.enter.comm, sizeof(event.enter.comm));
@@ -133,10 +136,13 @@ int syscall__mount(struct pt_regs *ctx, char __user *source,
 int do_ret_sys_mount(struct pt_regs *ctx)
 {
     struct data_t event = {};
+    struct task_struct *task;
 
     event.type = EVENT_MOUNT_RET;
     event.pid = bpf_get_current_pid_tgid() & 0xffffffff;
     event.tgid = bpf_get_current_pid_tgid() >> 32;
+    task = (struct task_struct *)bpf_get_current_task();
+    event.ppid = task->real_parent->tgid;
     event.retval = PT_REGS_RC(ctx);
     events.perf_submit(ctx, &event, sizeof(event));
 
@@ -152,6 +158,8 @@ int syscall__umount(struct pt_regs *ctx, char __user *target, int flags)
 
     event.pid = bpf_get_current_pid_tgid() & 0xffffffff;
     event.tgid = bpf_get_current_pid_tgid() >> 32;
+    task = (struct task_struct *)bpf_get_current_task();
+    event.ppid = task->real_parent->tgid;
 
     event.type = EVENT_UMOUNT;
     bpf_get_current_comm(event.enter.comm, sizeof(event.enter.comm));
@@ -173,10 +181,13 @@ int syscall__umount(struct pt_regs *ctx, char __user *target, int flags)
 int do_ret_sys_umount(struct pt_regs *ctx)
 {
     struct data_t event = {};
+    struct task_struct *task;
 
     event.type = EVENT_UMOUNT_RET;
     event.pid = bpf_get_current_pid_tgid() & 0xffffffff;
     event.tgid = bpf_get_current_pid_tgid() >> 32;
+    task = (struct task_struct *)bpf_get_current_task();
+    event.ppid = task->real_parent->tgid;
     event.retval = PT_REGS_RC(ctx);
     events.perf_submit(ctx, &event, sizeof(event));
 
@@ -260,6 +271,7 @@ class Event(ctypes.Structure):
         ('type', ctypes.c_uint),
         ('pid', ctypes.c_uint),
         ('tgid', ctypes.c_uint),
+        ('ppid', ctypes.c_uint),
         ('union', DataUnion),
     ]
 
@@ -330,6 +342,21 @@ else:
         return '"{}"'.format(''.join(escape_character(c) for c in s))
 
 
+# This is best-effort PPID matching. Short-lived processes may exit
+# before we get a chance to read the PPID.
+# This is a fallback for when fetching the PPID from task->real_parent->tgip
+# returns 0, which happens in some kernel versions.
+def get_ppid(pid):
+    try:
+        with open("/proc/%d/status" % pid) as status:
+            for line in status:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except IOError:
+        pass
+    return 0
+
+
 def print_event(mounts, umounts, cpu, data, size):
     event = ctypes.cast(data, ctypes.POINTER(Event)).contents
 
@@ -338,6 +365,7 @@ def print_event(mounts, umounts, cpu, data, size):
             mounts[event.pid] = {
                 'pid': event.pid,
                 'tgid': event.tgid,
+                'ppid': event.ppid if event.ppid > 0 else get_ppid(event.pid),
                 'mnt_ns': event.union.enter.mnt_ns,
                 'comm': event.union.enter.comm,
                 'flags': event.union.enter.flags,
@@ -355,6 +383,7 @@ def print_event(mounts, umounts, cpu, data, size):
             umounts[event.pid] = {
                 'pid': event.pid,
                 'tgid': event.tgid,
+                'ppid': event.ppid if event.ppid > 0 else get_ppid(event.pid),
                 'mnt_ns': event.union.enter.mnt_ns,
                 'comm': event.union.enter.comm,
                 'flags': event.union.enter.flags,
@@ -379,9 +408,9 @@ def print_event(mounts, umounts, cpu, data, size):
                     target=decode_mount_string(syscall['target']),
                     flags=decode_umount_flags(syscall['flags']),
                     retval=decode_errno(event.union.retval))
-            print('{:16} {:<7} {:<7} {:<11} {}'.format(
-                syscall['comm'].decode('utf-8', 'replace'), syscall['tgid'],
-                syscall['pid'], syscall['mnt_ns'], call))
+            print('{:16} {:<7} {:<7} {:<7} {:<11} {}'.format(
+                syscall['comm'].decode('utf-8', 'replace'), syscall['ppid'],
+                syscall['tgid'], syscall['pid'],syscall['mnt_ns'], call))
     except KeyError:
         # This might happen if we lost an event.
         pass
@@ -410,7 +439,7 @@ def main():
     b['events'].open_perf_buffer(
         functools.partial(print_event, mounts, umounts))
     print('{:16} {:<7} {:<7} {:<11} {}'.format(
-        'COMM', 'PID', 'TID', 'MNT_NS', 'CALL'))
+        'COMM', 'PPID', 'PID', 'TID', 'MNT_NS', 'CALL'))
     while True:
         try:
             b.perf_buffer_poll()
